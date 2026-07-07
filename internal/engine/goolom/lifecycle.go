@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -29,6 +30,12 @@ func (s *Session) Connect(ctx context.Context) error {
 	config := webrtc.Configuration{
 		ICEServers:   []webrtc.ICEServer{{URLs: []string{defaultSTUNURL}}},
 		SDPSemantics: webrtc.SDPSemanticsUnifiedPlan,
+	}
+	// White-hours hardening: OLCRTC_ICE_RELAY=1 forces TURN relay (skip flaky direct
+	// host UDP that RSTs/degrades to ~20s RTT in white-hours) so the carrier pins the
+	// stable TURN-TCP/TLS:443 path. Paired with the TCP4 ICE candidate type above.
+	if os.Getenv("OLCRTC_ICE_RELAY") == "1" {
+		config.ICETransportPolicy = webrtc.ICETransportPolicyRelay
 	}
 
 	if err := s.setupPeerConnections(config); err != nil {
@@ -122,7 +129,7 @@ func newWebRTCAPI() (*webrtc.API, error) {
 	// pairs starves ICE consent-freshness checks on the working pair, so the
 	// SFU stops receiving consent and tears down media after ~30-40 s. Limiting
 	// to IPv4 keeps the candidate set small and consent alive for the session.
-	settingEngine.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
+	settingEngine.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4, webrtc.NetworkTypeTCP4})
 	settingEngine.SetIPFilter(func(ip net.IP) bool {
 		return ip.To4() != nil
 	})
