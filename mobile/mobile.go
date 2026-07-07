@@ -846,3 +846,85 @@ func (b *logBridge) Write(p []byte) (int, error) {
 	b.w.WriteLog(string(p))
 	return len(p), nil
 }
+
+// --- Second isolated leg: direct LiveKit carrier ("Reserv-2") ---
+// The primary Start() is a package singleton (guarded by cancel). StartLK brings up a SECOND,
+// fully independent olcRTC leg on its own SOCKS port using its own lkCancel, so a direct
+// LiveKit carrier (WB Stream / self-hosted LiveKit, uncorrelated with the Telemost primary)
+// runs concurrently in the same process. Mirrors the isolated-client pattern of Check()/Ping().
+var (
+	errLKURLRequired   = errors.New("livekit url is required")
+	errLKTokenRequired = errors.New("livekit token is required")
+
+	lkMu     sync.Mutex         //nolint:gochecknoglobals // second-leg state, intentional
+	lkCancel context.CancelFunc //nolint:gochecknoglobals // second-leg state, intentional
+	lkDone   chan struct{}      //nolint:gochecknoglobals // second-leg state, intentional
+)
+
+// StartLK starts an isolated direct-LiveKit leg (auth "none", engine "livekit", transport
+// datachannel) on socksPort, concurrent with the primary Start() carrier. url/token are the
+// LiveKit signaling URL + access token (the token embeds the room); room is passed through for
+// peer binding; keyHex is the shared olcRTC payload cipher. Non-blocking: returns after launch
+// (validation errors are returned synchronously); connection status surfaces via the log.
+func StartLK(url, token, room, keyHex, clientID string, socksPort int) error {
+	registerDefaults()
+	switch {
+	case url == "":
+		return errLKURLRequired
+	case token == "":
+		return errLKTokenRequired
+	case keyHex == "":
+		return errKeyHexRequired
+	}
+
+	mu.Lock()
+	ensureDefaultConfigLocked()
+	cfg := defaults
+	mu.Unlock()
+
+	lkMu.Lock()
+	defer lkMu.Unlock()
+	if lkCancel != nil {
+		return errAlreadyRunning
+	}
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	lkCancel = cancelFunc
+	lkDone = make(chan struct{})
+	localDone := lkDone
+
+	go func() {
+		defer cancelFunc()
+		err := runClientWithReady(ctx, client.Config{
+			Transport: dataTransport,
+			Carrier:   "none",
+			Engine:    "livekit",
+			URL:       url,
+			Token:     token,
+			RoomURL:   room,
+			KeyHex:    keyHex,
+			DeviceID:  clientID,
+			LocalAddr: socksListenAddr(cfg.socksListenHost, socksPort),
+			DNSServer: cfg.dnsServer,
+			Liveness:  livenessConfig(cfg),
+		}, nil)
+		lkMu.Lock()
+		lkCancel = nil
+		lkMu.Unlock()
+		if err != nil {
+			log.Printf("olcRTC LK leg exited: %v", err)
+		}
+		close(localDone)
+	}()
+	return nil
+}
+
+// StopLK tears down the second LiveKit leg started by StartLK (no-op if not running).
+func StopLK() {
+	lkMu.Lock()
+	c := lkCancel
+	lkCancel = nil
+	lkMu.Unlock()
+	if c != nil {
+		c()
+	}
+}
