@@ -928,3 +928,113 @@ func StopLK() {
 		c()
 	}
 }
+
+// --- Generic multi-leg runner (N concurrent carrier legs) ---
+// StartLeg generalizes StartLK: it brings up an arbitrary number of fully
+// independent olcRTC legs, each on its own SOCKS port with its own cancel func,
+// so a mihomo load-balance group can aggregate throughput across N parallel
+// carrier rooms (e.g. N Telemost/vp8channel legs). Each leg bypasses the
+// package singleton used by Start()/cancel; legs are tracked in the legs map by
+// a monotonically increasing legID and torn down individually or en masse.
+var (
+	legMu  sync.Mutex                     //nolint:gochecknoglobals // multi-leg registry, intentional
+	legs   = map[int]context.CancelFunc{} //nolint:gochecknoglobals // multi-leg registry, intentional
+	legSeq int                            //nolint:gochecknoglobals // multi-leg id sequence, intentional
+)
+
+// StartLeg starts an isolated carrier leg on socksPort, concurrent with the
+// primary Start() carrier and with every other leg. It mirrors StartLK but is
+// PARAMETERIZED: carrier is the carrier name ("telemost", "wbstream", ...),
+// room is the room identifier (used as RoomURL), token is the (usually empty
+// for telemost) auth/access token, keyHex is the shared olcRTC payload cipher,
+// clientID is the per-leg device identifier, transport selects the transport
+// ("vp8channel" or "datachannel"; empty falls back to the configured default).
+// DNSServer, liveness, socks host and vp8 options are snapshotted from the
+// package defaults. Returns the legID for use with StopLeg, or an error if
+// validation fails. Non-blocking: connection status surfaces via the log.
+func StartLeg(carrier, room, token, keyHex, clientID, transport string, socksPort int) (int, error) {
+	registerDefaults()
+	carrier = normalizeCarrier(carrier)
+	switch {
+	case carrier == "":
+		return 0, errCarrierRequired
+	case room == "":
+		return 0, errRoomIDRequired
+	case clientID == "":
+		return 0, errClientIDRequired
+	case keyHex == "":
+		return 0, errKeyHexRequired
+	}
+
+	mu.Lock()
+	ensureDefaultConfigLocked()
+	cfg := defaults
+	mu.Unlock()
+
+	transportName := cfg.transport
+	if transport != "" {
+		transportName = normalizeTransport(transport)
+	}
+
+	ctx, cancelFunc := context.WithCancel(context.Background())
+
+	legMu.Lock()
+	legSeq++
+	id := legSeq
+	legs[id] = cancelFunc
+	legMu.Unlock()
+
+	go func() {
+		defer cancelFunc()
+		err := runClientWithReady(ctx, client.Config{
+			Transport: transportName,
+			Carrier:   carrier,
+			RoomURL:   room,
+			KeyHex:    keyHex,
+			DeviceID:  clientID,
+			Token:     token,
+			LocalAddr: socksListenAddr(cfg.socksListenHost, socksPort),
+			DNSServer: cfg.dnsServer,
+			TransportOptions: vp8channel.Options{
+				FPS:       cfg.vp8FPS,
+				BatchSize: cfg.vp8BatchSize,
+			},
+			Liveness: livenessConfig(cfg),
+		}, nil)
+		legMu.Lock()
+		delete(legs, id)
+		legMu.Unlock()
+		if err != nil {
+			log.Printf("olcRTC leg %d (%s) exited: %v", id, carrier, err)
+		}
+	}()
+	return id, nil
+}
+
+// StopLeg cancels and removes a single leg started by StartLeg (no-op if the id
+// is unknown or the leg already exited).
+func StopLeg(id int) {
+	legMu.Lock()
+	c := legs[id]
+	delete(legs, id)
+	legMu.Unlock()
+	if c != nil {
+		c()
+	}
+}
+
+// StopAllLegs cancels and removes every leg started by StartLeg.
+func StopAllLegs() {
+	legMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(legs))
+	for id, c := range legs {
+		cancels = append(cancels, c)
+		delete(legs, id)
+	}
+	legMu.Unlock()
+	for _, c := range cancels {
+		if c != nil {
+			c()
+		}
+	}
+}
